@@ -1,29 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Html5Qrcode } from "html5-qrcode";
-import type { Html5QrcodeResult } from "html5-qrcode";
+import { createBarcodeDecoder } from "../lib/barcode";
+import type { BarcodeDecoder, DetectedCode, ScanBox } from "../lib/barcode";
 import type { ScanDetails } from "../types";
-
-/** id элемента, в который html5-qrcode вставляет видео */
-const REGION_ID = "qr-camera-region";
 
 interface CameraScannerProps {
   /** Вызывается при успешном распознавании кода */
   onResult: (text: string, details?: ScanDetails) => void;
 }
 
-interface Box {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+interface CameraOption {
+  id: string;
+  label: string;
 }
+
+/** Как часто анализируем кадр камеры (мс). */
+const SCAN_INTERVAL_MS = 150;
+
+/** Окно, в течение которого один и тот же код не добавляется повторно. */
+const DUPLICATE_WINDOW_MS = 2000;
+
+/** Максимальная сторона сохраняемого снимка кадра (px). */
+const SNAPSHOT_MAX_SIDE = 960;
 
 /** Рисует рамку-подсветку области найденного кода на кадре. */
 function drawHighlight(
   ctx: CanvasRenderingContext2D,
   frameWidth: number,
   frameHeight: number,
-  box: Box,
+  box: ScanBox,
 ): void {
   const pad = Math.max(6, frameWidth * 0.012);
   const x = Math.max(0, box.x - pad);
@@ -42,49 +46,38 @@ function drawHighlight(
 }
 
 /**
- * Делает снимок текущего кадра камеры и подсвечивает на нём область найденного
- * кода. Координаты bounds из html5-qrcode заданы в «клиентских» пикселях области
- * сканирования (qrbox), поэтому пересчитываем их в пиксели исходного кадра.
+ * Делает снимок текущего кадра камеры и подсвечивает на нём область
+ * найденного кода. Декодер анализирует тот же кадр видео, поэтому его
+ * координаты совпадают с пикселями снимка (с поправкой на масштаб).
  */
-function captureDetectedFrame(result: Html5QrcodeResult | undefined): ScanDetails {
-  const format = result?.result?.format?.formatName;
-  const details: ScanDetails = { format };
+function captureFrame(video: HTMLVideoElement, code: DetectedCode): ScanDetails {
+  const details: ScanDetails = { format: code.format };
   try {
-    const region = document.getElementById(REGION_ID);
-    const video = region?.querySelector<HTMLVideoElement>("video") ?? null;
-    if (!video || !video.videoWidth || !video.videoHeight) {
-      return details;
-    }
+    const sourceWidth = video.videoWidth;
+    const sourceHeight = video.videoHeight;
+    if (!sourceWidth || !sourceHeight) return details;
 
-    const frame = document.createElement("canvas");
-    frame.width = video.videoWidth;
-    frame.height = video.videoHeight;
-    const ctx = frame.getContext("2d");
-    if (!ctx) {
-      return details;
-    }
-    ctx.drawImage(video, 0, 0, frame.width, frame.height);
+    const scale = Math.min(
+      1,
+      SNAPSHOT_MAX_SIDE / Math.max(sourceWidth, sourceHeight),
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(sourceWidth * scale);
+    canvas.height = Math.round(sourceHeight * scale);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return details;
 
-    const bounds = result?.result?.bounds;
-    const scanCanvas = region?.querySelector<HTMLCanvasElement>("canvas") ?? null;
-    const clientWidth = video.clientWidth;
-    const clientHeight = video.clientHeight;
-    if (bounds && scanCanvas && clientWidth > 0 && clientHeight > 0) {
-      // canvas.width/height — размер области сканирования в клиентских пикселях,
-      // она всегда центрирована относительно видео (см. getShadedRegionBounds).
-      const offsetX = (clientWidth - scanCanvas.width) / 2;
-      const offsetY = (clientHeight - scanCanvas.height) / 2;
-      const scaleX = frame.width / clientWidth;
-      const scaleY = frame.height / clientHeight;
-      drawHighlight(ctx, frame.width, frame.height, {
-        x: (offsetX + bounds.x) * scaleX,
-        y: (offsetY + bounds.y) * scaleY,
-        width: bounds.width * scaleX,
-        height: bounds.height * scaleY,
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (code.box) {
+      drawHighlight(ctx, canvas.width, canvas.height, {
+        x: code.box.x * scale,
+        y: code.box.y * scale,
+        width: code.box.width * scale,
+        height: code.box.height * scale,
       });
     }
 
-    details.imageUrl = frame.toDataURL("image/jpeg", 0.85);
+    details.imageUrl = canvas.toDataURL("image/jpeg", 0.85);
   } catch {
     // Снимок кадра — необязательное улучшение: ошибки съёмки игнорируем.
   }
@@ -92,173 +85,206 @@ function captureDetectedFrame(result: Html5QrcodeResult | undefined): ScanDetail
 }
 
 export default function CameraScanner({ onResult }: CameraScannerProps) {
-  const scannerRef = useRef<Html5Qrcode | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const decoderRef = useRef<Promise<BarcodeDecoder> | null>(null);
+  const loopRef = useRef<number | null>(null);
+  const busyRef = useRef(false);
   const lastResultRef = useRef<{ text: string; at: number } | null>(null);
+
   const [scanning, setScanning] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [cameras, setCameras] = useState<{ id: string; label: string }[]>([]);
+  const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [cameraId, setCameraId] = useState<string>("");
   const [lastFrame, setLastFrame] = useState<string | null>(null);
 
-  // Получаем список доступных камер (может потребовать разрешение).
-  useEffect(() => {
-    let cancelled = false;
-
-    Html5Qrcode.getCameras()
-      .then((devices) => {
-        if (cancelled) return;
-        const list = devices.map((d, i) => ({
-          id: d.id,
-          label: d.label || `Камера ${i + 1}`,
-        }));
-        setCameras(list);
-        // По умолчанию выбираем последнюю — обычно это задняя камера на телефоне.
-        if (list.length > 0) {
-          setCameraId(list[list.length - 1].id);
-        }
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(
-          err instanceof Error
-            ? err.message
-            : "Не удалось получить список камер. Разрешите доступ к камере.",
-        );
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const stop = useCallback(async () => {
-    const scanner = scannerRef.current;
-    if (!scanner) {
-      setScanning(false);
-      return;
-    }
+  /**
+   * Обновляет список камер. Названия устройств браузер отдаёт только после
+   * того, как пользователь разрешил доступ к камере.
+   */
+  const refreshCameras = useCallback(async () => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.enumerateDevices) return;
     try {
-      // stop() бросает синхронное исключение, если сканирование не запущено.
-      await scanner.stop();
-      scanner.clear();
+      const devices = await mediaDevices.enumerateDevices();
+      const list = devices
+        .filter((device) => device.kind === "videoinput")
+        .map((device, index) => ({
+          id: device.deviceId,
+          label: device.label || `Камера ${index + 1}`,
+        }));
+      setCameras(list);
+      // По умолчанию берём последнюю — на телефоне это обычно задняя камера.
+      setCameraId((prev) => prev || list[list.length - 1]?.id || "");
     } catch {
-      // Игнорируем: сканер мог быть уже остановлен.
+      // Список камер не критичен: сработает камера по умолчанию.
     }
-    setScanning(false);
   }, []);
 
-  const handleSuccess = useCallback(
-    (decodedText: string, result: Html5QrcodeResult) => {
-      // Не даём одному и тому же коду спамить историю чаще раза в 2 секунды.
+  useEffect(() => {
+    void refreshCameras();
+  }, [refreshCameras]);
+
+  const stopLoop = useCallback(() => {
+    if (loopRef.current !== null) {
+      window.clearInterval(loopRef.current);
+      loopRef.current = null;
+    }
+  }, []);
+
+  /** Полностью освобождает камеру и останавливает анализ кадров. */
+  const stop = useCallback(() => {
+    stopLoop();
+    const stream = streamRef.current;
+    streamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
+    const video = videoRef.current;
+    if (video) {
+      video.srcObject = null;
+    }
+    busyRef.current = false;
+    setScanning(false);
+  }, [stopLoop]);
+
+  const handleDecoded = useCallback(
+    (code: DetectedCode, video: HTMLVideoElement) => {
       const now = Date.now();
       const last = lastResultRef.current;
-      if (last && last.text === decodedText && now - last.at < 2000) {
+      if (last && last.text === code.text && now - last.at < DUPLICATE_WINDOW_MS) {
         return;
       }
-      lastResultRef.current = { text: decodedText, at: now };
+      lastResultRef.current = { text: code.text, at: now };
 
-      const details = captureDetectedFrame(result);
-      // Оставляем зафиксированный кадр с подсветкой на месте видео.
+      const details = captureFrame(video, code);
       if (details.imageUrl) {
         setLastFrame(details.imageUrl);
       }
-      onResult(decodedText, details);
+      onResult(code.text, details);
 
       // Автоматически останавливаем камеру после первого найденного кода,
       // чтобы сразу можно было посмотреть результат и перейти по ссылке.
-      window.setTimeout(() => {
-        void stop();
-      }, 0);
+      window.setTimeout(() => stop(), 0);
     },
     [onResult, stop],
   );
 
-  const start = useCallback(async () => {
-    setError(null);
-    setLastFrame(null);
-    setStarting(true);
+  const decodeFrame = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video || busyRef.current || !decoderRef.current) return;
+
+    const decoder = await decoderRef.current;
+    // readyState < 2 — у видео ещё нет готового кадра.
+    if (video.readyState < 2 || !video.videoWidth) return;
+
+    busyRef.current = true;
     try {
-      if (!scannerRef.current) {
-        if (!document.getElementById(REGION_ID)) {
+      const code = await decoder.decode(video);
+      if (code) handleDecoded(code, video);
+    } catch {
+      // Ошибка на отдельном кадре — это норма, просто пропускаем кадр.
+    } finally {
+      busyRef.current = false;
+    }
+  }, [handleDecoded]);
+
+  const start = useCallback(
+    async (deviceId?: string) => {
+      setError(null);
+      setLastFrame(null);
+      setStarting(true);
+      stopLoop();
+
+      try {
+        const mediaDevices = navigator.mediaDevices;
+        if (!mediaDevices?.getUserMedia) {
+          throw new Error(
+            "Браузер не даёт доступ к камере. Нужен https или localhost.",
+          );
+        }
+
+        const target = deviceId ?? cameraId;
+        const video: MediaStreamConstraints["video"] = target
+          ? {
+              deviceId: { exact: target },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            }
+          : {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            };
+
+        const stream = await mediaDevices.getUserMedia({ audio: false, video });
+        streamRef.current = stream;
+
+        const element = videoRef.current;
+        if (!element) {
           throw new Error("Область сканирования ещё не готова. Попробуйте ещё раз.");
         }
-        scannerRef.current = new Html5Qrcode(REGION_ID, { verbose: false });
-      }
+        element.srcObject = stream;
+        await element.play();
 
-      await scannerRef.current.start(
-        cameraId ? { deviceId: { exact: cameraId } } : { facingMode: "environment" },
-        {
-          fps: 10,
-          qrbox: { width: 260, height: 260 },
-          aspectRatio: 1,
-        },
-        handleSuccess,
-        () => {
-          // Ошибки кадров без кода — это норма, просто игнорируем.
-        },
-      );
-      setScanning(true);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Не удалось запустить камеру. Проверьте разрешения (нужен https или localhost).",
-      );
-    } finally {
-      setStarting(false);
-    }
-  }, [cameraId, handleSuccess]);
+        // После разрешения в списке появляются названия камер.
+        void refreshCameras();
+
+        // Движок распознавания создаётся лениво: при наличии нативного
+        // BarcodeDetector сторонний код не загружается вообще.
+        if (!decoderRef.current) {
+          decoderRef.current = createBarcodeDecoder();
+        }
+        const pending = decoderRef.current;
+        try {
+          await pending;
+        } catch {
+          // Разрешаем повторную попытку при следующем запуске.
+          decoderRef.current = null;
+          throw new Error(
+            "Не удалось загрузить модуль распознавания. Проверьте соединение и попробуйте снова.",
+          );
+        }
+
+        setScanning(true);
+        loopRef.current = window.setInterval(() => {
+          void decodeFrame();
+        }, SCAN_INTERVAL_MS);
+      } catch (err) {
+        stop();
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Не удалось запустить камеру. Проверьте разрешения (нужен https).",
+        );
+      } finally {
+        setStarting(false);
+      }
+    },
+    [cameraId, decodeFrame, refreshCameras, stop, stopLoop],
+  );
 
   // При смене камеры во время сканирования — перезапускаем поток.
-  useEffect(() => {
-    if (!scanning) return;
-    let active = true;
-
-    (async () => {
-      const scanner = scannerRef.current;
-      if (!scanner) return;
-      try {
-        await scanner.stop();
-        if (!active) return;
-        await scanner.start(
-          { deviceId: { exact: cameraId } },
-          { fps: 10, qrbox: { width: 260, height: 260 }, aspectRatio: 1 },
-          handleSuccess,
-          () => {},
-        );
-      } catch {
-        // при переключении камеры возможны кратковременные ошибки — игнорируем
-      }
-    })();
-
-    return () => {
-      active = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraId]);
+  const handleCameraChange = (id: string) => {
+    setCameraId(id);
+    if (scanning) {
+      stop();
+      void start(id);
+    }
+  };
 
   // Останавливаем камеру при размонтировании компонента.
   useEffect(() => {
     return () => {
-      const scanner = scannerRef.current;
-      scannerRef.current = null;
-      if (!scanner) return;
-      // stop() бросает синхронное исключение («Cannot stop, scanner is not
-      // running»), если сканирование не запущено. Раньше эта ошибка «вылетала»
-      // из cleanup-функции, и React размонтировал всё приложение — экран
-      // становился пустым (чаще всего при переходе на вкладку «Изображение»).
-      try {
-        const stopped = scanner.stop();
-        Promise.resolve(stopped)
-          .then(() => scanner.clear())
-          .catch(() => {});
-      } catch {
-        try {
-          scanner.clear();
-        } catch {
-          // Игнорируем: очищать уже нечего.
-        }
+      if (loopRef.current !== null) {
+        window.clearInterval(loopRef.current);
+        loopRef.current = null;
+      }
+      const stream = streamRef.current;
+      streamRef.current = null;
+      stream?.getTracks().forEach((track) => track.stop());
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = null;
       }
     };
   }, []);
@@ -267,9 +293,7 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
     <section className="panel">
       <div className="panel__head">
         <h2>Сканирование с камеры</h2>
-        <span
-          className={`badge ${scanning ? "badge--live" : "badge--idle"}`}
-        >
+        <span className={`badge ${scanning ? "badge--live" : "badge--idle"}`}>
           {scanning ? "● Идёт сканирование" : "○ Остановлено"}
         </span>
       </div>
@@ -279,7 +303,7 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
         <select
           id="camera-select"
           value={cameraId}
-          onChange={(e) => setCameraId(e.target.value)}
+          onChange={(e) => handleCameraChange(e.target.value)}
           disabled={cameras.length === 0}
         >
           {cameras.length === 0 && <option value="">Камеры не найдены</option>}
@@ -292,8 +316,17 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
       </div>
 
       <div className="viewport">
-        {/* Сюда html5-qrcode вставляет <video> */}
-        <div id={REGION_ID} className="viewport__region" />
+        <div
+          className={`viewport__region ${scanning ? "viewport__region--live" : ""}`}
+        >
+          <video
+            ref={videoRef}
+            className="viewport__video"
+            playsInline
+            muted
+            autoPlay
+          />
+        </div>
         {!scanning && lastFrame && (
           <img
             className="viewport__snapshot"
@@ -309,7 +342,7 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
         {!scanning ? (
           <button
             className="btn btn--primary"
-            onClick={start}
+            onClick={() => void start()}
             disabled={starting}
           >
             {starting ? "Запуск…" : "▶ Запустить камеру"}

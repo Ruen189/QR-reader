@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 import { VitePWA } from "vite-plugin-pwa";
@@ -82,6 +82,11 @@ export default defineConfig(({ mode }) => {
     preview: {
       host: true,
       port: 4173,
+    },
+    // Юнит-тесты запускаются в Node: тестируем чистую логику без DOM.
+    test: {
+      environment: "node",
+      include: ["src/**/*.test.ts"],
     },
   };
 });

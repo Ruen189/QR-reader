@@ -192,10 +192,6 @@ body {
 
 .viewport {
   position: relative;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  overflow: hidden;
-  background: #05060d;
   margin-bottom: 14px;
 }
 
@@ -203,6 +199,8 @@ body {
   display: block;
   width: 100%;
   height: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
   animation: snapshot-in 0.25s ease;
 }
 
@@ -219,17 +217,24 @@ body {
 
 .viewport__region {
   width: 100%;
+  /* До старта камеры <video> пуст, поэтому не занимаем им место в макете. */
+  height: 0;
+  overflow: hidden;
 }
 
-.viewport__region video {
+.viewport__region--live {
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  background: #05060d;
+}
+
+.viewport__video {
   display: block;
-  width: 100% !important;
-  height: auto !important;
-  border-radius: 0;
-}
-
-.viewport__region img {
-  display: none;
+  width: 100%;
+  height: auto;
+  min-height: 0;
 }
 
 .dropzone {

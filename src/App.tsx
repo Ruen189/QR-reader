@@ -1,43 +1,36 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { Capacitor } from "@capacitor/core";
-import CameraScanner from "./components/CameraScanner";
-import FileScanner from "./components/FileScanner";
 import { usePwaInstall } from "./hooks/usePwaInstall";
+import { addToHistory, loadHistory, saveHistory } from "./lib/scanHistory";
+import { isLikelyUrl } from "./lib/url";
 import type { ScanDetails } from "./types";
 
 type Tab = "camera" | "file";
 
-/** Ключ, под которым история сканирований сохраняется в localStorage. */
-const HISTORY_STORAGE_KEY = "qr-scanner:history";
-
-/** Максимальное число сохраняемых записей истории. */
-const HISTORY_LIMIT = 20;
-
 /**
- * Загружает историю сканирований из localStorage. Возвращает пустой массив,
- * если хранилище недоступно или данные повреждены.
+ * Сканеры подгружаются лениво: тяжёлый движок распознавания попадает в
+ * отдельный чанк и скачивается только при открытии соответствующей вкладки.
  */
-function loadHistory(): string[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item): item is string => typeof item === "string")
-      .slice(0, HISTORY_LIMIT);
-  } catch {
-    return [];
-  }
-}
+const CameraScanner = lazy(() => import("./components/CameraScanner"));
+const FileScanner = lazy(() => import("./components/FileScanner"));
 
-function isLikelyUrl(text: string): boolean {
-  try {
-    const url = new URL(text);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
+/** Заглушка, пока лениво загружаемый сканер ещё не приехал. */
+function ScannerFallback() {
+  return (
+    <section className="panel">
+      <div className="panel__head">
+        <h2>Загрузка…</h2>
+      </div>
+      <p className="muted">Готовим сканер.</p>
+    </section>
+  );
 }
 
 /**
@@ -83,18 +76,12 @@ export default function App() {
     setCopied(false);
     setResult(text);
     setResultImage(details?.imageUrl ?? "");
-    setHistory((prev) =>
-      prev[0] === text ? prev : [text, ...prev].slice(0, HISTORY_LIMIT),
-    );
+    setHistory((prev) => addToHistory(prev, text));
   }, []);
 
   // Сохраняем историю в localStorage, чтобы она не терялась при перезапуске.
   useEffect(() => {
-    try {
-      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
-    } catch {
-      // Хранилище может быть недоступно (приватный режим) — игнорируем.
-    }
+    saveHistory(history);
   }, [history]);
 
   const handleError = useCallback((message: string) => {
@@ -155,11 +142,13 @@ export default function App() {
       </nav>
 
       <main className="app__main">
-        {tab === "camera" ? (
-          <CameraScanner onResult={handleResult} />
-        ) : (
-          <FileScanner onResult={handleResult} onError={handleError} />
-        )}
+        <Suspense fallback={<ScannerFallback />}>
+          {tab === "camera" ? (
+            <CameraScanner onResult={handleResult} />
+          ) : (
+            <FileScanner onResult={handleResult} onError={handleError} />
+          )}
+        </Suspense>
 
         <section className="panel">
           <div className="panel__head">
