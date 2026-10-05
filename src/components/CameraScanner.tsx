@@ -97,7 +97,6 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
   const [error, setError] = useState<string | null>(null);
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [cameraId, setCameraId] = useState<string>("");
-  const [lastFrame, setLastFrame] = useState<string | null>(null);
 
   /**
    * Обновляет список камер. Названия устройств браузер отдаёт только после
@@ -157,9 +156,6 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
       lastResultRef.current = { text: code.text, at: now };
 
       const details = captureFrame(video, code);
-      if (details.imageUrl) {
-        setLastFrame(details.imageUrl);
-      }
       onResult(code.text, details);
 
       // Автоматически останавливаем камеру после первого найденного кода,
@@ -191,7 +187,6 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
   const start = useCallback(
     async (deviceId?: string) => {
       setError(null);
-      setLastFrame(null);
       setStarting(true);
       stopLoop();
 
@@ -292,14 +287,13 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
   return (
     <section className="panel">
       <div className="panel__head">
-        <h2>Сканирование с камеры</h2>
+        <h2>Камера</h2>
         <span className={`badge ${scanning ? "badge--live" : "badge--idle"}`}>
           {scanning ? "● Идёт сканирование" : "○ Остановлено"}
         </span>
       </div>
 
       <div className="cameras">
-        <label htmlFor="camera-select">Камера</label>
         <select
           id="camera-select"
           value={cameraId}
@@ -327,13 +321,6 @@ export default function CameraScanner({ onResult }: CameraScannerProps) {
             autoPlay
           />
         </div>
-        {!scanning && lastFrame && (
-          <img
-            className="viewport__snapshot"
-            src={lastFrame}
-            alt="Кадр с выделенной областью найденного кода"
-          />
-        )}
       </div>
 
       {error && <p className="alert">{error}</p>}

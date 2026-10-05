@@ -17,6 +17,8 @@
     "typecheck": "tsc --noEmit",
     "android:sync": "npm run build:android && cap sync android",
     "android:copy": "npm run build:android && cap copy android",
+    "android:apk": "npm run android:sync && node scripts/android-install.mjs --apk-only",
+    "android:install": "npm run android:sync && node scripts/android-install.mjs",
     "android:open": "cap open android",
     "android:run": "cap run android"
   },

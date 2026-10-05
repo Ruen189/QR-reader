@@ -40,6 +40,18 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // Подписываем debug-сборку ТЕМ ЖЕ ключом, что и release.
+            // Зачем: Android разрешает обновлять приложение только если у старой и
+            // новой версии совпадают package id И сертификат подписи. По умолчанию
+            // debug подписывается автоматическим ~/.android/debug.keystore, поэтому
+            // `cap run android` поверх release-версии падает с
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE и требует удалять приложение
+            // (вместе с историей сканов). С общим ключом debug-APK встаёт поверх.
+            if (hasReleaseKeystore) {
+                signingConfig signingConfigs.release
+            }
+        }
         release {
             // R8: удаляет недостижимый код и переименовывает классы/методы.
             minifyEnabled true
